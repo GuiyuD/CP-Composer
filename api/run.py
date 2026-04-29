@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import argparse
+import inspect
 from tqdm import tqdm
 from os.path import splitext, basename
 
@@ -24,6 +25,7 @@ from evaluation.dG.openmm_relaxer import ForceFieldMinimizer
 class DesignDataset(torch.utils.data.Dataset):
 
     MAX_N_ATOM = 14
+    AA_DIM = 20
 
     def __init__(self, pdbs, epitopes, lengths_range=None, seqs=None) -> None:
         super().__init__()
@@ -112,6 +114,8 @@ class DesignDataset(torch.utils.data.Dataset):
         cov = cov + eps * np.identity(cov.shape[0])
         L = torch.from_numpy(np.linalg.cholesky(cov)).float().unsqueeze(0)
 
+        atom_gt = torch.zeros((len(lig_blocks), self.AA_DIM), dtype=torch.float)
+
         return {
             'X': X,                                                         # [N, 14] or [N, 4] if backbone_only == True
             'S': torch.tensor(S, dtype=torch.long),                         # [N]
@@ -120,7 +124,8 @@ class DesignDataset(torch.utils.data.Dataset):
             'atom_mask': atom_mask,                                         # [N, 14] or [N, 4], 1 for having records in the PDB
             'lengths': len(S),
             'rec_chain2blocks': rec_chain2blocks,
-            'L': L
+            'L': L,
+            'atom_gt': atom_gt
         }
 
     def collate_fn(self, batch):
@@ -189,14 +194,22 @@ def design(mode, ckpt, gpu, pdbs, epitope_defs, n_samples, out_dir,
                 if hasattr(batch[k], 'to'):
                     batch[k] = batch[k].to(device)
             # generate
+            sample_kwargs = {
+                'L': batch['L'],
+                'sample_opt': {
+                    'energy_func': 'default',
+                    'energy_lambda': 0.5 if mode == 'struct_pred' else 0.8
+                }
+            }
+            sig = inspect.signature(model.sample)
+            if 'atom_gt' in sig.parameters:
+                sample_kwargs['atom_gt'] = batch.get('atom_gt', None)
+
             batch_X, batch_S, batch_pmetric = model.sample(
                 batch['X'], batch['S'],
                 batch['mask'], batch['position_ids'],
                 batch['lengths'], batch['atom_mask'],
-                L=batch['L'], sample_opt={
-                    'energy_func': 'default',
-                    'energy_lambda': 0.5 if mode == 'struct_pred' else 0.8
-                }
+                **sample_kwargs
             )
         # save data
         for X, S, pmetric, rec_chain2blocks in zip(batch_X, batch_S, batch_pmetric, batch['rec_chain2blocks']):
@@ -252,13 +265,14 @@ def parse():
     parser.add_argument('--length_min', type=int, required='codesign' in sys.argv, help='Minimum peptide length for codesign (inclusive)')
     parser.add_argument('--length_max', type=int, required='codesign' in sys.argv, help='Maximum peptide length for codesign (exclusive)')
     parser.add_argument('--gpu', type=int, default=0, help='GPU to use')
+    parser.add_argument('--ckpt', type=str, default=None, help='Optional path to checkpoint. If not set, use default under ./checkpoints')
     return parser.parse_args()
 
 
 if __name__ == '__main__':
     args = parse()
     proj_dir = os.path.join(os.path.dirname(__file__), '..')
-    ckpt = os.path.join(proj_dir, 'checkpoints', 'fixseq.ckpt' if args.mode == 'struct_pred' else 'codesign.ckpt')
+    ckpt = args.ckpt if args.ckpt is not None else os.path.join(proj_dir, 'checkpoints', 'fixseq.ckpt' if args.mode == 'struct_pred' else 'codesign.ckpt')
     print_log(f'Loading checkpoint: {ckpt}')
     design(
         mode=args.mode,
